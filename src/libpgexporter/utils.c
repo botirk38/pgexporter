@@ -888,10 +888,20 @@ pgexporter_set_proc_title(int argc, char** argv, char* s1, char* s2)
    max_process_title_size = size;
 
 #else
-   setproctitle("-pgexporter: %s%s%s",
-                s1 != NULL ? s1 : "",
-                s1 != NULL && s2 != NULL ? "/" : "",
-                s2 != NULL ? s2 : "");
+#if (defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) || \
+   defined(__OpenBSD__))
+   setproctitle("-pgexporter: %s%s%s", s1 != NULL ? s1 : "",
+                s1 != NULL && s2 != NULL ? "/" : "", s2 != NULL ? s2 : "");
+#elif defined(HAVE_DARWIN)
+   // macOS alternative to setproctitle
+   // setprogname does not accept formatted strings
+   char proc_title[128];
+   snprintf(proc_title, sizeof(proc_title), "-pgexporter: %s%s%s",
+            s1 != NULL ? s1 : "",
+            s1 != NULL && s2 != NULL ? "/" : "",
+            s2 != NULL ? s2 : "");
+   setprogname(proc_title);
+#endif
 
 #endif
 }
@@ -2482,7 +2492,7 @@ pgexporter_backtrace(void)
 int
 pgexporter_os_kernel_version(char** os, int* kernel_major, int* kernel_minor, int* kernel_patch)
 {
-
+   bool bsd = false;
    *os = NULL;
    *kernel_major = 0;
    *kernel_minor = 0;
@@ -2519,12 +2529,20 @@ pgexporter_os_kernel_version(char** os, int* kernel_major, int* kernel_minor, in
       goto error;
    }
    *kernel_patch = 0; // BSD doesn't use patch version
+   bsd = true;
 
 #endif
 
-   pgexporter_log_debug("OS: %s | Kernel Version: %d.%d.%d", *os, *kernel_major, *kernel_minor, *kernel_patch);
-   return 0;
+   if (!bsd)
+   {
+      pgexporter_log_debug("OS: %s | Kernel Version: %d.%d.%d", *os, *kernel_major, *kernel_minor, *kernel_patch);
+   }
+   else
+   {
+      pgexporter_log_debug("OS: %s | Version: %d.%d", *os, *kernel_major, *kernel_minor);
+   }
 
+   return 0;
 error:
    //Free memory if already allocated
    if (*os != NULL)
