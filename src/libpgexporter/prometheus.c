@@ -27,6 +27,9 @@
  */
 
 /* pgexporter */
+#include "art.h"
+#include "prometheus_client.h"
+#include "value.h"
 #include <pgexporter.h>
 #include <logging.h>
 #include <memory.h>
@@ -116,23 +119,20 @@ static int bad_request(int client_fd);
 
 static bool collector_pass(const char* collector);
 
-static void add_column_to_store(column_store_t* store, int n_store, char* data, int sort_type, struct tuple* current);
 
-static void general_information(int client_fd);
-static void core_information(int client_fd);
-static void extension_information(int client_fd);
-static void extension_function(int client_fd, char* function, int input, char* description, char* type);
-static void server_information(int client_fd);
-static void version_information(int client_fd);
-static void uptime_information(int client_fd);
-static void primary_information(int client_fd);
-static void settings_information(int client_fd);
-static void custom_metrics(int client_fd); // Handles custom metrics provided in YAML format, both internal and external
-static void append_help_info(char** data, char* tag, char* name, char* description);
-static void append_type_info(char** data, char* tag, char* name, int typeId);
+static void general_information(int client_fd, struct prometheus_bridge* bridge);
+static void core_information(int client_fd, struct prometheus_bridge* bridge);
+static void extension_information(int client_fd, struct prometheus_bridge* bridge);
+static void extension_function(int client_fd, struct prometheus_bridge* bridge, char* function, int input, char* description, char* type);
+static void server_information(int client_fd, struct prometheus_bridge* bridge);
+static void version_information(int client_fd, struct prometheus_bridge* bridge);
+static void uptime_information(int client_fd, struct prometheus_bridge* bridge);
+static void primary_information(int client_fd, struct prometheus_bridge* bridge);
+static void settings_information(int client_fd, struct prometheus_bridge* bridge);
+static void custom_metrics(int client_fd, struct prometheus_bridge* bridge); // Handles custom metrics provided in YAML format, both internal and external
 
-static void handle_histogram(column_store_t* store, int* n_store, query_list_t* temp);
-static void handle_gauge_counter(column_store_t* store, int* n_store, query_list_t* temp);
+static void handle_histogram(struct prometheus_bridge* bridge, query_list_t* temp);
+static void handle_gauge_counter(struct prometheus_bridge*,  query_list_t* temp);
 
 static int send_chunk(int client_fd, char* data);
 static int parse_list(char* list_str, char** strs, int* n_strs);
@@ -492,6 +492,8 @@ error:
    return 1;
 }
 
+
+
 static int
 metrics_page(int client_fd)
 {
@@ -505,6 +507,7 @@ metrics_page(int client_fd)
    struct prometheus_cache* cache;
    signed char cache_is_free;
    struct configuration* config;
+   struct prometheus_bridge* bridge = NULL;
 
    config = (struct configuration*)shmem;
    cache = (struct prometheus_cache*)prometheus_cache_shmem;
@@ -575,17 +578,105 @@ retry_cache_locking:
 
          pgexporter_open_connections();
 
-         /* General Metric Collector */
-         general_information(client_fd);
-         core_information(client_fd);
-         server_information(client_fd);
-         version_information(client_fd);
-         uptime_information(client_fd);
-         primary_information(client_fd);
-         settings_information(client_fd);
-         extension_information(client_fd);
+         /* Create the bridge */
+         if (pgexporter_prometheus_client_create_bridge(&bridge))
+         {
+            goto error;
+         }
 
-         custom_metrics(client_fd);
+         /* General Metric Collector */
+         general_information(client_fd, bridge);
+         core_information(client_fd, bridge);
+         server_information(client_fd, bridge);
+         version_information(client_fd, bridge);
+         uptime_information(client_fd, bridge);
+         primary_information(client_fd, bridge);
+         settings_information(client_fd, bridge);
+         extension_information(client_fd, bridge);
+
+         custom_metrics(client_fd, bridge);
+
+         /* Convert bridge to text format and send */
+         struct art_iterator* metrics_iterator = NULL;
+         if (pgexporter_art_iterator_create(bridge->metrics, &metrics_iterator))
+         {
+            goto error;
+         }
+
+         while (pgexporter_art_iterator_next(metrics_iterator))
+         {
+            struct prometheus_metric* metric_data = (struct prometheus_metric*)metrics_iterator->value->data;
+            struct deque_iterator* definition_iterator = NULL;
+
+            data = pgexporter_append(data, "#HELP ");
+            data = pgexporter_append(data, metric_data->name);
+            data = pgexporter_append_char(data, ' ');
+            data = pgexporter_append(data, metric_data->help);
+            data = pgexporter_append_char(data, '\n');
+
+            data = pgexporter_append(data, "#TYPE ");
+            data = pgexporter_append(data, metric_data->name);
+            data = pgexporter_append_char(data, ' ');
+            data = pgexporter_append(data, metric_data->type);
+            data = pgexporter_append_char(data, '\n');
+
+            if (pgexporter_deque_iterator_create(metric_data->definitions, &definition_iterator))
+            {
+               goto error;
+            }
+
+            while (pgexporter_deque_iterator_next(definition_iterator))
+            {
+               struct deque_iterator* attributes_iterator = NULL;
+               struct prometheus_attributes* attrs_data = (struct prometheus_attributes*)definition_iterator->value->data;
+               struct prometheus_value* value_data = NULL;
+
+               if (pgexporter_deque_iterator_create(attrs_data->attributes, &attributes_iterator))
+               {
+                  goto error;
+               }
+
+               value_data = (struct prometheus_value*)pgexporter_deque_peek_last(attrs_data->values, NULL);
+
+               data = pgexporter_append(data, metric_data->name);
+               data = pgexporter_append_char(data, '{');
+
+               while (pgexporter_deque_iterator_next(attributes_iterator))
+               {
+                  struct prometheus_attribute* attr_data = (struct prometheus_attribute*)attributes_iterator->value->data;
+
+                  data = pgexporter_append(data, attr_data->key);
+                  data = pgexporter_append(data, "=\"");
+                  data = pgexporter_append(data, attr_data->value);
+                  data = pgexporter_append_char(data, '\"');
+
+                  if (pgexporter_deque_iterator_has_next(attributes_iterator))
+                  {
+                     data = pgexporter_append(data, ", ");
+                  }
+               }
+
+               data = pgexporter_append(data, "} ");
+               data = pgexporter_append(data, value_data->value);
+
+               data = pgexporter_append_char(data, '\n');
+
+               pgexporter_deque_iterator_destroy(attributes_iterator);
+            }
+
+            data = pgexporter_append_char(data, '\n');
+
+            metrics_cache_append(data);
+            send_chunk(client_fd, data);
+
+            pgexporter_deque_iterator_destroy(definition_iterator);
+
+            free(data);
+            data = NULL;
+         }
+
+         pgexporter_art_iterator_destroy(metrics_iterator);
+         pgexporter_prometheus_client_destroy_bridge(bridge);
 
          pgexporter_close_connections();
 
@@ -625,11 +716,16 @@ retry_cache_locking:
    return 0;
 
 error:
+   if (bridge != NULL)
+   {
+      pgexporter_prometheus_client_destroy_bridge(bridge);
+   }
 
    free(data);
 
    return 1;
 }
+
 
 static int
 bad_request(int client_fd)
@@ -691,103 +787,242 @@ collector_pass(const char* collector)
 }
 
 static void
-general_information(int client_fd)
+general_information(int client_fd, struct prometheus_bridge* bridge)
 {
-   char* data = NULL;
-   struct configuration* config;
 
+   struct prometheus_metric* metric = NULL;
+   struct prometheus_attributes* attrs = NULL;
+   struct prometheus_value* val = NULL;
+   struct configuration* config;
    config = (struct configuration*)shmem;
 
-   data = pgexporter_vappend(data, 4,
-                             "#HELP pgexporter_state The state of pgexporter\n",
-                             "#TYPE pgexporter_state gauge\n",
-                             "pgexporter_state 1\n",
-                             "\n"
-                             );
 
-   data = pgexporter_append(data, "#HELP pgexporter_logging_info The number of INFO logging statements\n");
-   data = pgexporter_append(data, "#TYPE pgexporter_logging_info gauge\n");
-   data = pgexporter_append(data, "pgexporter_logging_info ");
-   data = pgexporter_append_ulong(data, atomic_load(&config->logging_info));
-   data = pgexporter_append(data, "\n\n");
-   data = pgexporter_append(data, "#HELP pgexporter_logging_warn The number of WARN logging statements\n");
-   data = pgexporter_append(data, "#TYPE pgexporter_logging_warn gauge\n");
-   data = pgexporter_append(data, "pgexporter_logging_warn ");
-   data = pgexporter_append_ulong(data, atomic_load(&config->logging_warn));
-   data = pgexporter_append(data, "\n\n");
-   data = pgexporter_append(data, "#HELP pgexporter_logging_error The number of ERROR logging statements\n");
-   data = pgexporter_append(data, "#TYPE pgexporter_logging_error gauge\n");
-   data = pgexporter_append(data, "pgexporter_logging_error ");
-   data = pgexporter_append_ulong(data, atomic_load(&config->logging_error));
-   data = pgexporter_append(data, "\n\n");
-   data = pgexporter_append(data, "#HELP pgexporter_logging_fatal The number of FATAL logging statements\n");
-   data = pgexporter_append(data, "#TYPE pgexporter_logging_fatal gauge\n");
-   data = pgexporter_append(data, "pgexporter_logging_fatal ");
-   data = pgexporter_append_ulong(data, atomic_load(&config->logging_fatal));
-   data = pgexporter_append(data, "\n\n");
+  /* pgexporter_state */
+   metric = malloc(sizeof(struct prometheus_metric));
+   memset(metric, 0, sizeof(struct prometheus_metric));
+   
+   metric->name = strdup("pgexporter_state");
+   metric->help = strdup("The state of pgexporter");
+   metric->type = strdup("gauge");
+   
+   pgexporter_deque_create(true, &metric->definitions);
+   
+   attrs = malloc(sizeof(struct prometheus_attributes));
+   memset(attrs, 0, sizeof(struct prometheus_attributes));
+   
+   pgexporter_deque_create(true, &attrs->attributes);
+   pgexporter_deque_create(true, &attrs->values);
+   
+   val = malloc(sizeof(struct prometheus_value));
+   memset(val, 0, sizeof(struct prometheus_value));
+   
+   val->timestamp = time(NULL);
+   val->value = strdup("1");
+   
+   pgexporter_deque_add(attrs->values, NULL, (uintptr_t)val, ValueRef );
+   pgexporter_deque_add(metric->definitions, NULL, (uintptr_t)attrs, ValueRef);
+   
+   pgexporter_art_insert(bridge->metrics, metric->name, (uintptr_t)metric, ValueRef);
 
-   if (data != NULL)
-   {
-      send_chunk(client_fd, data);
-      metrics_cache_append(data);
-      free(data);
-      data = NULL;
-   }
+   /* pgexporter_logging_info */
+   metric = malloc(sizeof(struct prometheus_metric));
+   memset(metric, 0, sizeof(struct prometheus_metric));
+   
+   metric->name = strdup("pgexporter_logging_info");
+   metric->help = strdup("The number of INFO logging statements");
+   metric->type = strdup("gauge");
+   
+   pgexporter_deque_create(true, &metric->definitions);
+   
+   attrs = malloc(sizeof(struct prometheus_attributes));
+   memset(attrs, 0, sizeof(struct prometheus_attributes));
+   
+   pgexporter_deque_create(true, &attrs->attributes);
+   pgexporter_deque_create(true, &attrs->values);
+   
+   val = malloc(sizeof(struct prometheus_value));
+   memset(val, 0, sizeof(struct prometheus_value));
+   
+   val->timestamp = time(NULL);
+   val->value = malloc(32);
+   sprintf(val->value, "%ld", atomic_load(&config->logging_info));
+   
+   pgexporter_deque_add(attrs->values, NULL, (uintptr_t)val, ValueRef);
+   pgexporter_deque_add(metric->definitions, NULL, (uintptr_t)attrs, ValueRef);
+   
+   pgexporter_art_insert(bridge->metrics, metric->name, (uintptr_t)metric, ValueRef);
+
+   /* pgexporter_logging_warn */
+   metric = malloc(sizeof(struct prometheus_metric));
+   memset(metric, 0, sizeof(struct prometheus_metric));
+   
+   metric->name = strdup("pgexporter_logging_warn");
+   metric->help = strdup("The number of WARN logging statements");
+   metric->type = strdup("gauge");
+   
+   pgexporter_deque_create(true, &metric->definitions);
+   
+   attrs = malloc(sizeof(struct prometheus_attributes));
+   memset(attrs, 0, sizeof(struct prometheus_attributes));
+   
+   pgexporter_deque_create(true, &attrs->attributes);
+   pgexporter_deque_create(true, &attrs->values);
+   
+   val = malloc(sizeof(struct prometheus_value));
+   memset(val, 0, sizeof(struct prometheus_value));
+   
+   val->timestamp = time(NULL);
+   val->value = malloc(32);
+   sprintf(val->value, "%ld", atomic_load(&config->logging_warn));
+   
+   pgexporter_deque_add(attrs->values, NULL, (uintptr_t)val, ValueRef);
+   pgexporter_deque_add(metric->definitions, NULL, (uintptr_t)attrs, ValueRef);
+   
+   pgexporter_art_insert(bridge->metrics, metric->name, (uintptr_t)metric, ValueRef);
+
+   /* pgexporter_logging_error */
+   metric = malloc(sizeof(struct prometheus_metric));
+   memset(metric, 0, sizeof(struct prometheus_metric));
+   
+   metric->name = strdup("pgexporter_logging_error");
+   metric->help = strdup("The number of ERROR logging statements");
+   metric->type = strdup("gauge");
+   
+   pgexporter_deque_create(true, &metric->definitions);
+   
+   attrs = malloc(sizeof(struct prometheus_attributes));
+   memset(attrs, 0, sizeof(struct prometheus_attributes));
+   
+   pgexporter_deque_create(true, &attrs->attributes);
+   pgexporter_deque_create(true, &attrs->values);
+   
+   val = malloc(sizeof(struct prometheus_value));
+   memset(val, 0, sizeof(struct prometheus_value));
+   
+   val->timestamp = time(NULL);
+   val->value = malloc(32);
+   sprintf(val->value, "%ld", atomic_load(&config->logging_error));
+   
+   pgexporter_deque_add(attrs->values, NULL, (uintptr_t)val, ValueRef);
+   pgexporter_deque_add(metric->definitions, NULL, (uintptr_t)attrs, ValueRef);
+   
+   pgexporter_art_insert(bridge->metrics, metric->name, (uintptr_t)metric, ValueRef);
+
+   /* pgexporter_logging_fatal */
+   metric = malloc(sizeof(struct prometheus_metric));
+   memset(metric, 0, sizeof(struct prometheus_metric));
+   
+   metric->name = strdup("pgexporter_logging_fatal");
+   metric->help = strdup("The number of FATAL logging statements");
+   metric->type = strdup("gauge");
+   
+   pgexporter_deque_create(true, &metric->definitions);
+   
+   attrs = malloc(sizeof(struct prometheus_attributes));
+   memset(attrs, 0, sizeof(struct prometheus_attributes));
+   
+   pgexporter_deque_create(true, &attrs->attributes);
+   pgexporter_deque_create(true, &attrs->values);
+   
+   val = malloc(sizeof(struct prometheus_value));
+   memset(val, 0, sizeof(struct prometheus_value));
+   
+   val->timestamp = time(NULL);
+   val->value = malloc(32);
+   sprintf(val->value, "%ld", atomic_load(&config->logging_fatal));
+   
+   pgexporter_deque_add(attrs->values, NULL, (uintptr_t)val, ValueRef);
+   pgexporter_deque_add(metric->definitions, NULL, (uintptr_t)attrs, ValueRef);
+   
+   pgexporter_art_insert(bridge->metrics, metric->name, (uintptr_t)metric, ValueRef);
 }
 
+
 static void
-server_information(int client_fd)
+server_information(int client_fd, struct prometheus_bridge* bridge)
 {
-   char* data = NULL;
+   struct prometheus_metric* metric = NULL;
+   struct prometheus_attributes* attrs = NULL;
+   struct prometheus_attribute* attr = NULL;
+   struct prometheus_value* val = NULL;
    struct configuration* config;
 
    config = (struct configuration*)shmem;
 
-   data = pgexporter_vappend(data, 2,
-                             "#HELP pgexporter_postgresql_active The state of PostgreSQL\n",
-                             "#TYPE pgexporter_postgresql_active gauge\n"
-                             );
-
+   /* Create pgexporter_postgresql_active metric */
+   metric = malloc(sizeof(struct prometheus_metric));
+   memset(metric, 0, sizeof(struct prometheus_metric));
+   
+   metric->name = strdup("pgexporter_postgresql_active");
+   metric->help = strdup("The state of PostgreSQL");
+   metric->type = strdup("gauge");
+   
+   /* Create definitions deque - using thread_safe=false */
+   pgexporter_deque_create(false, &metric->definitions);
+   
+   /* Add server attributes for each server */
    for (int server = 0; server < config->number_of_servers; server++)
    {
-      data = pgexporter_vappend(data, 3,
-                                "pgexporter_postgresql_active{server=\"",
-                                &config->servers[server].name[0],
-                                "\"} "
-                                );
+      attrs = malloc(sizeof(struct prometheus_attributes));
+      memset(attrs, 0, sizeof(struct prometheus_attributes));
+      
+      /* Create attributes and values deques */
+      pgexporter_deque_create(false, &attrs->attributes);
+      pgexporter_deque_create(false, &attrs->values);
+      
+      /* Add server attribute */
+      attr = malloc(sizeof(struct prometheus_attribute));
+      memset(attr, 0, sizeof(struct prometheus_attribute));
+      
+      attr->key = strdup("server");
+      attr->value = strdup(config->servers[server].name);
+      
+      /* Add attribute to attributes deque */
+      pgexporter_deque_add(attrs->attributes, NULL, (uintptr_t)attr, ValueRef);
+      
+      /* Create value */
+      val = malloc(sizeof(struct prometheus_value));
+      memset(val, 0, sizeof(struct prometheus_value));
+      
+      val->timestamp = time(NULL);
+      
+      /* Set value based on server state */
       if (config->servers[server].fd != -1)
       {
-         data = pgexporter_append(data, "1");
+         val->value = strdup("1");
       }
       else
       {
-         data = pgexporter_append(data, "0");
+         val->value = strdup("0");
       }
-      data = pgexporter_append(data, "\n");
+      
+      /* Add value to values deque */
+      pgexporter_deque_add(attrs->values, NULL, (uintptr_t)val, ValueRef);
+      
+      /* Add attributes to definitions */
+      pgexporter_deque_add(metric->definitions, NULL, (uintptr_t)attrs, ValueRef);
    }
-   data = pgexporter_append(data, "\n");
-
-   if (data != NULL)
-   {
-      send_chunk(client_fd, data);
-      metrics_cache_append(data);
-      free(data);
-      data = NULL;
-   }
+   
+   /* Add metric to bridge */
+   pgexporter_art_insert(bridge->metrics, metric->name, (uintptr_t)metric, ValueRef);
 }
 
+
 static void
-version_information(int client_fd)
+version_information(int client_fd, struct prometheus_bridge* bridge)
 {
    int ret;
    int server;
-   char* data = NULL;
    char* safe_key1 = NULL;
    char* safe_key2 = NULL;
    struct query* all = NULL;
    struct query* query = NULL;
    struct tuple* current = NULL;
    struct configuration* config;
+   struct prometheus_metric* metric = NULL;
+   struct prometheus_attributes* attrs = NULL;
+   struct prometheus_attribute* attr = NULL;
+   struct prometheus_value* val = NULL;
 
    config = (struct configuration*)shmem;
 
@@ -809,60 +1044,99 @@ version_information(int client_fd)
       current = all->tuples;
       if (current != NULL)
       {
-         data = pgexporter_vappend(data, 2,
-                                   "#HELP pgexporter_postgresql_version The PostgreSQL version\n",
-                                   "#TYPE pgexporter_postgresql_version gauge\n"
-                                   );
-
+         /* Create pgexporter_postgresql_version metric */
+         metric = malloc(sizeof(struct prometheus_metric));
+         memset(metric, 0, sizeof(struct prometheus_metric));
+         
+         metric->name = strdup("pgexporter_postgresql_version");
+         metric->help = strdup("The PostgreSQL version");
+         metric->type = strdup("gauge");
+         
+         pgexporter_deque_create(false, &metric->definitions);
+         
          server = 0;
-
+         
          while (current != NULL)
          {
+            /* Create attributes for this server */
+            attrs = malloc(sizeof(struct prometheus_attributes));
+            memset(attrs, 0, sizeof(struct prometheus_attributes));
+            
+            pgexporter_deque_create(false, &attrs->attributes);
+            pgexporter_deque_create(false, &attrs->values);
+            
+            /* Add server attribute */
+            attr = malloc(sizeof(struct prometheus_attribute));
+            memset(attr, 0, sizeof(struct prometheus_attribute));
+            
+            attr->key = strdup("server");
+            attr->value = strdup(config->servers[server].name);
+            
+            pgexporter_deque_add(attrs->attributes, NULL, (uintptr_t)attr, ValueRef);
+            
+            /* Add version attribute */
+            attr = malloc(sizeof(struct prometheus_attribute));
+            memset(attr, 0, sizeof(struct prometheus_attribute));
+            
+            attr->key = strdup("version");
             safe_key1 = safe_prometheus_key(pgexporter_get_column(0, current));
+            attr->value = strdup(safe_key1);
+            
+            pgexporter_deque_add(attrs->attributes, NULL, (uintptr_t)attr, ValueRef);
+            
+            /* Add minor_version attribute */
+            attr = malloc(sizeof(struct prometheus_attribute));
+            memset(attr, 0, sizeof(struct prometheus_attribute));
+            
+            attr->key = strdup("minor_version");
             safe_key2 = safe_prometheus_key(pgexporter_get_column(1, current));
-            data = pgexporter_vappend(data, 8,
-                                      "pgexporter_postgresql_version{server=\"",
-                                      &config->servers[server].name[0],
-                                      "\",version=\"",
-                                      safe_key1,
-                                      "\",minor_version=\"",
-                                      safe_key2,
-                                      "\"} ",
-                                      "1\n"
-                                      );
+            attr->value = strdup(safe_key2);
+            
+            pgexporter_deque_add(attrs->attributes, NULL, (uintptr_t)attr, ValueRef);
+            
+            /* Create value */
+            val = malloc(sizeof(struct prometheus_value));
+            memset(val, 0, sizeof(struct prometheus_value));
+            
+            val->timestamp = time(NULL);
+            val->value = strdup("1");
+            
+            pgexporter_deque_add(attrs->values, NULL, (uintptr_t)val, ValueRef);
+            
+            /* Add attributes to definitions */
+            pgexporter_deque_add(metric->definitions, NULL, (uintptr_t)attrs, ValueRef);
+            
             safe_prometheus_key_free(safe_key1);
             safe_prometheus_key_free(safe_key2);
-
+            
             server++;
             current = current->next;
          }
-
-         data = pgexporter_append(data, "\n");
-
-         if (data != NULL)
-         {
-            send_chunk(client_fd, data);
-            metrics_cache_append(data);
-            free(data);
-            data = NULL;
-         }
+         
+         /* Add metric to bridge */
+         pgexporter_art_insert(bridge->metrics, metric->name, (uintptr_t)metric, ValueRef);
       }
    }
 
    pgexporter_free_query(all);
 }
 
+
+
 static void
-uptime_information(int client_fd)
+uptime_information(int client_fd, struct prometheus_bridge* bridge)
 {
    int ret;
    int server;
-   char* data = NULL;
    char* safe_key = NULL;
    struct query* all = NULL;
    struct query* query = NULL;
    struct tuple* current = NULL;
    struct configuration* config;
+   struct prometheus_metric* metric = NULL;
+   struct prometheus_attributes* attrs = NULL;
+   struct prometheus_attribute* attr = NULL;
+   struct prometheus_value* val = NULL;
 
    config = (struct configuration*)shmem;
 
@@ -884,38 +1158,56 @@ uptime_information(int client_fd)
       current = all->tuples;
       if (current != NULL)
       {
-         data = pgexporter_vappend(data, 2,
-                                   "#HELP pgexporter_postgresql_uptime The PostgreSQL uptime in seconds\n",
-                                   "#TYPE pgexporter_postgresql_uptime counter\n"
-                                   );
-
+         /* Create pgexporter_postgresql_uptime metric */
+         metric = malloc(sizeof(struct prometheus_metric));
+         memset(metric, 0, sizeof(struct prometheus_metric));
+         
+         metric->name = strdup("pgexporter_postgresql_uptime");
+         metric->help = strdup("The PostgreSQL uptime in seconds");
+         metric->type = strdup("counter");
+         
+         pgexporter_deque_create(false, &metric->definitions);
+         
          server = 0;
 
          while (current != NULL)
          {
+            attrs = malloc(sizeof(struct prometheus_attributes));
+            memset(attrs, 0, sizeof(struct prometheus_attributes));
+            
+            pgexporter_deque_create(false, &attrs->attributes);
+            pgexporter_deque_create(false, &attrs->values);
+            
+            /* Add server attribute */
+            attr = malloc(sizeof(struct prometheus_attribute));
+            memset(attr, 0, sizeof(struct prometheus_attribute));
+            
+            attr->key = strdup("server");
+            attr->value = strdup(config->servers[server].name);
+            
+            pgexporter_deque_add(attrs->attributes, NULL, (uintptr_t)attr, ValueRef);
+            
+            /* Create value */
+            val = malloc(sizeof(struct prometheus_value));
+            memset(val, 0, sizeof(struct prometheus_value));
+            
+            val->timestamp = time(NULL);
+            
             safe_key = safe_prometheus_key(pgexporter_get_column(0, current));
-            data = pgexporter_vappend(data, 5,
-                                      "pgexporter_postgresql_uptime{server=\"",
-                                      &config->servers[server].name[0],
-                                      "\"} ",
-                                      safe_key,
-                                      "\n"
-                                      );
+            val->value = strdup(safe_key);
             safe_prometheus_key_free(safe_key);
-
+            
+            pgexporter_deque_add(attrs->values, NULL, (uintptr_t)val, ValueRef);
+            
+            /* Add attributes to definitions */
+            pgexporter_deque_add(metric->definitions, NULL, (uintptr_t)attrs, ValueRef);
+            
             server++;
             current = current->next;
          }
-
-         data = pgexporter_append(data, "\n");
-
-         if (data != NULL)
-         {
-            send_chunk(client_fd, data);
-            metrics_cache_append(data);
-            free(data);
-            data = NULL;
-         }
+         
+         /* Add metric to bridge */
+         pgexporter_art_insert(bridge->metrics, metric->name, (uintptr_t)metric, ValueRef);
       }
    }
 
@@ -923,15 +1215,18 @@ uptime_information(int client_fd)
 }
 
 static void
-primary_information(int client_fd)
+primary_information(int client_fd, struct prometheus_bridge* bridge)
 {
    int ret;
    int server;
-   char* data = NULL;
    struct query* all = NULL;
    struct query* query = NULL;
    struct tuple* current = NULL;
    struct configuration* config;
+   struct prometheus_metric* metric = NULL;
+   struct prometheus_attributes* attrs = NULL;
+   struct prometheus_attribute* attr = NULL;
+   struct prometheus_value* val = NULL;
 
    config = (struct configuration*)shmem;
 
@@ -953,75 +1248,126 @@ primary_information(int client_fd)
       current = all->tuples;
       if (current != NULL)
       {
-         data = pgexporter_vappend(data, 2,
-                                   "#HELP pgexporter_postgresql_primary Is the PostgreSQL instance the primary\n",
-                                   "#TYPE pgexporter_postgresql_primary gauge\n"
-                                   );
-
+         /* Create pgexporter_postgresql_primary metric */
+         metric = malloc(sizeof(struct prometheus_metric));
+         memset(metric, 0, sizeof(struct prometheus_metric));
+         
+         metric->name = strdup("pgexporter_postgresql_primary");
+         metric->help = strdup("Is the PostgreSQL instance the primary");
+         metric->type = strdup("gauge");
+         
+         pgexporter_deque_create(false, &metric->definitions);
+         
          server = 0;
 
          while (current != NULL)
          {
-            data = pgexporter_vappend(data, 3,
-                                      "pgexporter_postgresql_primary{server=\"",
-                                      &config->servers[server].name[0],
-                                      "\"} "
-                                      );
-
+            attrs = malloc(sizeof(struct prometheus_attributes));
+            memset(attrs, 0, sizeof(struct prometheus_attributes));
+            
+            pgexporter_deque_create(false, &attrs->attributes);
+            pgexporter_deque_create(false, &attrs->values);
+            
+            /* Add server attribute */
+            attr = malloc(sizeof(struct prometheus_attribute));
+            memset(attr, 0, sizeof(struct prometheus_attribute));
+            
+            attr->key = strdup("server");
+            attr->value = strdup(config->servers[server].name);
+            
+            pgexporter_deque_add(attrs->attributes, NULL, (uintptr_t)attr, ValueRef);
+            
+            /* Create value */
+            val = malloc(sizeof(struct prometheus_value));
+            memset(val, 0, sizeof(struct prometheus_value));
+            
+            val->timestamp = time(NULL);
+            
+            /* Set value based on primary status */
             if (!strcmp("t", pgexporter_get_column(0, current)))
             {
-               data = pgexporter_append(data, "1");
+               val->value = strdup("1");
             }
             else
             {
-               data = pgexporter_append(data, "0");
+               val->value = strdup("0");
             }
-            data = pgexporter_append(data, "\n");
-
+            
+            pgexporter_deque_add(attrs->values, NULL, (uintptr_t)val, ValueRef);
+            
+            /* Add attributes to definitions */
+            pgexporter_deque_add(metric->definitions, NULL, (uintptr_t)attrs, ValueRef);
+            
             server++;
             current = current->next;
          }
-
-         data = pgexporter_append(data, "\n");
-
-         if (data != NULL)
-         {
-            send_chunk(client_fd, data);
-            metrics_cache_append(data);
-            free(data);
-            data = NULL;
-         }
+         
+         /* Add metric to bridge */
+         pgexporter_art_insert(bridge->metrics, metric->name, (uintptr_t)metric, ValueRef);
       }
    }
 
    pgexporter_free_query(all);
 }
 
+
 static void
-core_information(int client_fd)
+core_information(int client_fd, struct prometheus_bridge* bridge)
 {
-   char* data = NULL;
+   struct prometheus_metric* metric = NULL;
+   struct prometheus_attributes* attrs = NULL;
+   struct prometheus_attribute* attr = NULL;
+   struct prometheus_value* val = NULL;
 
-   data = pgexporter_vappend(data, 6,
-                             "#HELP pgexporter_version The pgexporter version\n",
-                             "#TYPE pgexporter_version counter\n",
-                             "pgexporter_version{pgexporter_version=\"",
-                             VERSION,
-                             "\"} 1\n",
-                             "\n"
-                             );
-
-   if (data != NULL)
-   {
-      send_chunk(client_fd, data);
-      metrics_cache_append(data);
-      free(data);
-      data = NULL;
-   }
+   /* Create pgexporter_version metric */
+   metric = malloc(sizeof(struct prometheus_metric));
+   memset(metric, 0, sizeof(struct prometheus_metric));
+   
+   metric->name = strdup("pgexporter_version");
+   metric->help = strdup("The pgexporter version");
+   metric->type = strdup("counter");
+   
+   /* Create definitions deque */
+   pgexporter_deque_create(false, &metric->definitions);
+   
+   /* Create attributes */
+   attrs = malloc(sizeof(struct prometheus_attributes));
+   memset(attrs, 0, sizeof(struct prometheus_attributes));
+   
+   pgexporter_deque_create(false, &attrs->attributes);
+   pgexporter_deque_create(false, &attrs->values);
+   
+   /* Add pgexporter_version attribute */
+   attr = malloc(sizeof(struct prometheus_attribute));
+   memset(attr, 0, sizeof(struct prometheus_attribute));
+   
+   attr->key = strdup("pgexporter_version");
+   attr->value = strdup(VERSION);
+   
+   /* Add attribute to attributes deque */
+   pgexporter_deque_add(attrs->attributes, NULL, (uintptr_t)attr, ValueRef);
+   
+   /* Create value */
+   val = malloc(sizeof(struct prometheus_value));
+   memset(val, 0, sizeof(struct prometheus_value));
+   
+   val->timestamp = time(NULL);
+   val->value = strdup("1");
+   
+   /* Add value to values deque */
+   pgexporter_deque_add(attrs->values, NULL, (uintptr_t)val, ValueRef);
+   
+   /* Add attributes to definitions */
+   pgexporter_deque_add(metric->definitions, NULL, (uintptr_t)attrs, ValueRef);
+   
+   /* Add metric to bridge */
+   pgexporter_art_insert(bridge->metrics, metric->name, (uintptr_t)metric, ValueRef);
 }
 
+
+
 static void
-extension_information(int client_fd)
+extension_information(int client_fd, struct prometheus_bridge* bridge)
 {
    bool cont = true;
    struct query* query = NULL;
@@ -1053,15 +1399,15 @@ extension_information(int client_fd)
                {
                   if (strcmp(tuple->data[0], "pgexporter_get_functions"))
                   {
-                     extension_function(client_fd, tuple->data[0], false, tuple->data[2], tuple->data[3]);
+                     extension_function(client_fd, bridge, tuple->data[0], false, tuple->data[2], tuple->data[3]);
                   }
                }
                else
                {
                   if (strcmp(tuple->data[0], "pgexporter_is_supported"))
                   {
-                     extension_function(client_fd, tuple->data[0], INPUT_DATA, tuple->data[2], tuple->data[3]);
-                     extension_function(client_fd, tuple->data[0], INPUT_WAL, tuple->data[2], tuple->data[3]);
+                     extension_function(client_fd, bridge, tuple->data[0], INPUT_DATA, tuple->data[2], tuple->data[3]);
+                     extension_function(client_fd, bridge, tuple->data[0], INPUT_WAL, tuple->data[2], tuple->data[3]);
                   }
                }
 
@@ -1083,16 +1429,43 @@ extension_information(int client_fd)
 }
 
 static void
-extension_function(int client_fd, char* function, int input, char* description, char* type)
+extension_function(int client_fd, struct prometheus_bridge* bridge, char* function, int input, char* description, char* type)
 {
-   char* data = NULL;
-   bool header = false;
    char* sql = NULL;
    struct query* query = NULL;
    struct tuple* tuple = NULL;
    struct configuration* config;
+   struct prometheus_metric* metric = NULL;
+   struct prometheus_attributes* attrs = NULL;
+   struct prometheus_attribute* attr = NULL;
+   struct prometheus_value* val = NULL;
+   char metric_name[256];
 
    config = (struct configuration*)shmem;
+
+   /* Create metric name based on function and input type */
+   if (input == INPUT_DATA)
+   {
+      snprintf(metric_name, sizeof(metric_name), "%s_data", function);
+   }
+   else if (input == INPUT_WAL)
+   {
+      snprintf(metric_name, sizeof(metric_name), "%s_wal", function);
+   }
+   else
+   {
+      snprintf(metric_name, sizeof(metric_name), "%s", function);
+   }
+
+   /* Create metric */
+   metric = malloc(sizeof(struct prometheus_metric));
+   memset(metric, 0, sizeof(struct prometheus_metric));
+   
+   metric->name = strdup(metric_name);
+   metric->help = strdup(description);
+   metric->type = strdup(type);
+   
+   pgexporter_deque_create(false, &metric->definitions);
 
    for (int server = 0; server < config->number_of_servers; server++)
    {
@@ -1133,50 +1506,9 @@ extension_function(int client_fd, char* function, int input, char* description, 
          if (query == NULL)
          {
             config->servers[server].extension = false;
-
             free(sql);
             sql = NULL;
-
             continue;
-         }
-
-         if (!header)
-         {
-            data = pgexporter_append(data, "#HELP ");
-            data = pgexporter_append(data, function);
-
-            if (input == INPUT_DATA)
-            {
-               data = pgexporter_append(data, "_data");
-            }
-            else if (input == INPUT_WAL)
-            {
-               data = pgexporter_append(data, "_wal");
-            }
-
-            data = pgexporter_vappend(data, 3,
-                                      " ",
-                                      description,
-                                      "\n");
-
-            data = pgexporter_append(data, "#TYPE ");
-            data = pgexporter_append(data, function);
-
-            if (input == INPUT_DATA)
-            {
-               data = pgexporter_append(data, "_data");
-            }
-            else if (input == INPUT_WAL)
-            {
-               data = pgexporter_append(data, "_wal");
-            }
-
-            data = pgexporter_vappend(data, 3,
-                                      " ",
-                                      type,
-                                      "\n");
-
-            header = true;
          }
 
          config->servers[server].extension = true;
@@ -1185,63 +1517,76 @@ extension_function(int client_fd, char* function, int input, char* description, 
 
          while (tuple != NULL)
          {
-            data = pgexporter_append(data, function);
+            attrs = malloc(sizeof(struct prometheus_attributes));
+            memset(attrs, 0, sizeof(struct prometheus_attributes));
+            
+            pgexporter_deque_create(false, &attrs->attributes);
+            pgexporter_deque_create(false, &attrs->values);
+            
+            /* Add server attribute */
+            attr = malloc(sizeof(struct prometheus_attribute));
+            memset(attr, 0, sizeof(struct prometheus_attribute));
+            
+            attr->key = strdup("server");
+            attr->value = strdup(config->servers[server].name);
+            
+            pgexporter_deque_add(attrs->attributes, NULL, (uintptr_t)attr, ValueRef);
 
-            if (input == INPUT_DATA)
+            if (input != INPUT_NO)
             {
-               data = pgexporter_append(data, "_data");
-            }
-            else if (input == INPUT_WAL)
-            {
-               data = pgexporter_append(data, "_wal");
-            }
-
-            data = pgexporter_vappend(data, 3,
-                                      "{server=\"",
-                                      &config->servers[server].name[0],
-                                      "\"");
-
-            if (query->number_of_columns > 0)
-            {
-               data = pgexporter_append(data, ", ");
-            }
-
-            if (input == INPUT_NO)
-            {
-               for (int col = 0; col < query->number_of_columns; col++)
-               {
-                  data = pgexporter_vappend(data, 4,
-                                            query->names[col],
-                                            "=\"",
-                                            tuple->data[col],
-                                            "\"");
-
-                  if (col < query->number_of_columns - 1)
-                  {
-                     data = pgexporter_append(data, ", ");
-                  }
-               }
-
-               data = pgexporter_append(data, "} 1\n");
-            }
-            else
-            {
-               data = pgexporter_append(data, "location=\"");
-
+               /* Add location attribute */
+               attr = malloc(sizeof(struct prometheus_attribute));
+               memset(attr, 0, sizeof(struct prometheus_attribute));
+               
+               attr->key = strdup("location");
+               
                if (input == INPUT_DATA)
                {
-                  data = pgexporter_append(data, config->servers[server].data);
+                  attr->value = strdup(config->servers[server].data);
                }
                else if (input == INPUT_WAL)
                {
-                  data = pgexporter_append(data, config->servers[server].wal);
+                  attr->value = strdup(config->servers[server].wal);
                }
-
-               data = pgexporter_append(data, "\"} ");
-               data = pgexporter_append(data, tuple->data[0]);
-               data = pgexporter_append(data, "\n");
+               
+               pgexporter_deque_add(attrs->attributes, NULL, (uintptr_t)attr, ValueRef);
+               
+               /* Create value */
+               val = malloc(sizeof(struct prometheus_value));
+               memset(val, 0, sizeof(struct prometheus_value));
+               
+               val->timestamp = time(NULL);
+               val->value = strdup(tuple->data[0]);
+               
+               pgexporter_deque_add(attrs->values, NULL, (uintptr_t)val, ValueRef);
             }
-
+            else
+            {
+               /* Add column attributes */
+               for (int col = 0; col < query->number_of_columns; col++)
+               {
+                  attr = malloc(sizeof(struct prometheus_attribute));
+                  memset(attr, 0, sizeof(struct prometheus_attribute));
+                  
+                  attr->key = strdup(query->names[col]);
+                  attr->value = strdup(tuple->data[col]);
+                  
+                  pgexporter_deque_add(attrs->attributes, NULL, (uintptr_t)attr, ValueRef);
+               }
+               
+               /* Create value with constant 1 */
+               val = malloc(sizeof(struct prometheus_value));
+               memset(val, 0, sizeof(struct prometheus_value));
+               
+               val->timestamp = time(NULL);
+               val->value = strdup("1");
+               
+               pgexporter_deque_add(attrs->values, NULL, (uintptr_t)val, ValueRef);
+            }
+            
+            /* Add attributes to definitions */
+            pgexporter_deque_add(metric->definitions, NULL, (uintptr_t)attrs, ValueRef);
+            
             tuple = tuple->next;
          }
 
@@ -1253,30 +1598,24 @@ extension_function(int client_fd, char* function, int input, char* description, 
       }
    }
 
-   if (header)
-   {
-      data = pgexporter_append(data, "\n");
-   }
-
-   if (data != NULL)
-   {
-      send_chunk(client_fd, data);
-      metrics_cache_append(data);
-      free(data);
-      data = NULL;
-   }
+   /* Add metric to bridge */
+   pgexporter_art_insert(bridge->metrics, metric->name, (uintptr_t)metric, ValueRef);
 }
 
+
 static void
-settings_information(int client_fd)
+settings_information(int client_fd, struct prometheus_bridge* bridge)
 {
    int ret;
-   char* data = NULL;
    char* safe_key = NULL;
    struct query* all = NULL;
    struct query* query = NULL;
    struct tuple* current = NULL;
    struct configuration* config;
+   struct prometheus_metric* metric = NULL;
+   struct prometheus_attributes* attrs = NULL;
+   struct prometheus_attribute* attr = NULL;
+   struct prometheus_value* val = NULL;
 
    config = (struct configuration*)shmem;
 
@@ -1305,73 +1644,91 @@ settings_information(int client_fd)
       while (current != NULL)
       {
          safe_key = safe_prometheus_key(pgexporter_get_column(0, current));
-         data = pgexporter_vappend(data, 12,
-                                   "#HELP pgexporter_",
-                                   &all->tag[0],
-                                   "_",
-                                   safe_key,
-                                   " ",
-                                   pgexporter_get_column(2, current),
-                                   "\n",
-                                   "#TYPE pgexporter_",
-                                   &all->tag[0],
-                                   "_",
-                                   safe_key,
-                                   " gauge\n"
-                                   );
-         safe_prometheus_key_free(safe_key);
-
-data:
-         safe_key = safe_prometheus_key(pgexporter_get_column(0, current));
-         data = pgexporter_vappend(data, 9,
-                                   "pgexporter_",
-                                   &all->tag[0],
-                                   "_",
-                                   safe_key,
-                                   "{server=\"",
-                                   &config->servers[current->server].name[0],
-                                   "\"} ",
-                                   get_value(&all->tag[0], pgexporter_get_column(0, current), pgexporter_get_column(1, current)),
-                                   "\n"
-                                   );
-         safe_prometheus_key_free(safe_key);
-
-         if (current->next != NULL && !strcmp(pgexporter_get_column(0, current), pgexporter_get_column(0, current->next)))
+         
+         /* Create metric for this setting */
+         char metric_name[256];
+         snprintf(metric_name, sizeof(metric_name), "pgexporter_%s_%s", all->tag, safe_key);
+         
+         /* Check if metric already exists in the bridge */
+         uintptr_t existing = pgexporter_art_search(bridge->metrics, metric_name);
+         if (existing != 0)
          {
-            current = current->next;
-            goto data;
+            /* Metric already exists, add another server's data */
+            metric = (struct prometheus_metric*)existing;
          }
-
-         if (data != NULL)
+         else
          {
-            data = pgexporter_append(data, "\n");
-
-            send_chunk(client_fd, data);
-            metrics_cache_append(data);
-            free(data);
-            data = NULL;
+            /* Create new metric */
+            metric = malloc(sizeof(struct prometheus_metric));
+            memset(metric, 0, sizeof(struct prometheus_metric));
+            
+            metric->name = strdup(metric_name);
+            metric->help = strdup(pgexporter_get_column(2, current));
+            metric->type = strdup("gauge");
+            
+            pgexporter_deque_create(false, &metric->definitions);
+            
+            /* Add to bridge */
+            pgexporter_art_insert(bridge->metrics, metric_name, (uintptr_t)metric, ValueRef);
          }
-
+         
+         /* Process all servers with this setting */
+         while (current != NULL && 
+                (current->next == NULL || 
+                 strcmp(pgexporter_get_column(0, current), pgexporter_get_column(0, current->next)) == 0))
+         {
+            attrs = malloc(sizeof(struct prometheus_attributes));
+            memset(attrs, 0, sizeof(struct prometheus_attributes));
+            
+            pgexporter_deque_create(false, &attrs->attributes);
+            pgexporter_deque_create(false, &attrs->values);
+            
+            /* Add server attribute */
+            attr = malloc(sizeof(struct prometheus_attribute));
+            memset(attr, 0, sizeof(struct prometheus_attribute));
+            
+            attr->key = strdup("server");
+            attr->value = strdup(config->servers[current->server].name);
+            
+            pgexporter_deque_add(attrs->attributes, NULL, (uintptr_t)attr, ValueRef);
+            
+            /* Create value */
+            val = malloc(sizeof(struct prometheus_value));
+            memset(val, 0, sizeof(struct prometheus_value));
+            
+            val->timestamp = time(NULL);
+            val->value = strdup(get_value(all->tag, pgexporter_get_column(0, current), pgexporter_get_column(1, current)));
+            
+            pgexporter_deque_add(attrs->values, NULL, (uintptr_t)val, ValueRef);
+            
+            /* Add attributes to definitions */
+            pgexporter_deque_add(metric->definitions, NULL, (uintptr_t)attrs, ValueRef);
+            
+            if (current->next != NULL && 
+                strcmp(pgexporter_get_column(0, current), pgexporter_get_column(0, current->next)) == 0)
+            {
+               current = current->next;
+            }
+            else
+            {
+               break;
+            }
+         }
+         
+         safe_prometheus_key_free(safe_key);
          current = current->next;
       }
-   }
-
-   if (data != NULL)
-   {
-      send_chunk(client_fd, data);
-      metrics_cache_append(data);
-      free(data);
-      data = NULL;
    }
 
    pgexporter_free_query(all);
 }
 
+
+
 static void
-custom_metrics(int client_fd)
+custom_metrics(int client_fd, struct prometheus_bridge* bridge)
 {
    struct configuration* config = NULL;
-   char* data = NULL;
 
    config = (struct configuration*)shmem;
 
@@ -1460,53 +1817,25 @@ custom_metrics(int client_fd)
       }
    }
 
-   /* Tuples */
+   /* Process query results */
    temp = q_list;
-   column_store_t store[MISC_LENGTH] = {0};
-   int n_store = 0;
-
    while (temp)
    {
       if (temp->error || (temp->query != NULL && temp->query->tuples != NULL))
       {
          if (temp->query_alt->is_histogram)
          {
-            handle_histogram(store, &n_store, temp);
-         }
-         else
-         {
-            handle_gauge_counter(store, &n_store, temp);
-         }
+        handle_histogram(bridge, temp);
+         } else {
+        handle_gauge_counter(bridge, temp);
+         
+      }
+         
       }
       temp = temp->next;
    }
 
-   for (int i = 0; i < n_store; i++)
-   {
-      column_node_t* temp = store[i].columns,
-                   * last = NULL;
-
-      while (temp)
-      {
-         data = pgexporter_append(data, temp->data);
-         last = temp;
-         temp = temp->next;
-
-         // Free it
-         free(last->data);
-         free(last);
-      }
-      data = pgexporter_append(data, "\n");
-   }
-
-   if (data)
-   {
-      send_chunk(client_fd, data);
-      metrics_cache_append(data);
-      free(data);
-      data = NULL;
-   }
-
+   /* Clean up */
    temp = q_list;
    query_list_t* last = NULL;
    while (temp)
@@ -1523,119 +1852,158 @@ custom_metrics(int client_fd)
    q_list = NULL;
 }
 
-static int
-parse_list(char* list_str, char** strs, int* n_strs)
-{
-   int idx = 0;
-   char* data = NULL;
-   char* p = NULL;
-   int len = strlen(list_str);
-
-   /**
-    * If the `list_str` is `{c1,c2,c3,...,cn}`, and if the `strlen(list_str)`
-    * is `x`, then it takes `x + 1` bytes in memory including the null character.
-    *
-    * `data` will have `list_str` without the first and last bracket (so `data` will
-    * just be `c1,c2,c3,...,cn`) and thus `strlen(data)` will be `x - 2`, and
-    * so will take `x - 1` bytes in memory including the null character.
-    */
-   data = (char*) malloc((len - 1) * sizeof(char));
-   memset(data, 0, (len - 1) * sizeof(char));
-
-   /**
-    * If list_str is `{c1,c2,c3,...,cn}`, then and if `len(list_str)` is `len`
-    * then this starts from `c1`, and goes for `len - 2`, so till `cn`, so the
-    * `data` string becomes `c1,c2,c3,...,cn`
-    */
-   strncpy(data, list_str + 1, len - 2);
-
-   p = strtok(data, ",");
-   while (p)
-   {
-      strs[idx] = NULL;
-      strs[idx] = pgexporter_append(strs[idx], p);
-      idx++;
-      p = strtok(NULL, ",");
-   }
-
-   *n_strs = idx;
-   free(data);
-   return 0;
-}
-
 static void
-add_column_to_store(column_store_t* store, int store_idx, char* data, int sort_type, struct tuple* current)
+handle_gauge_counter(struct prometheus_bridge* bridge, query_list_t* temp)
 {
-   column_node_t* new_node = malloc(sizeof(column_node_t));
-   memset(new_node, 0, sizeof(column_node_t));
+   struct configuration* config;
+   struct prometheus_metric* metric = NULL;
+   struct prometheus_attributes* attrs = NULL;
+   struct prometheus_attribute* attr = NULL;
+   struct prometheus_value* val = NULL;
+   char metric_name[256];
+   
+   config = (struct configuration*)shmem;
 
-   new_node->data = data;
-   new_node->tuple = current;
-
-   if (!store[store_idx].columns)
+   if (!temp || !temp->query || !temp->query->tuples)
    {
-      store[store_idx].columns = new_node;
-      store[store_idx].last_column = new_node;
+      /* Skip */
       return;
    }
 
-   if (sort_type == SORT_DATA0)
+   for (int i = 0; i < temp->query_alt->n_columns; i++)
    {
-      // SORT_DATA0 means sorting according to the first data (data[0]) in a tuple.
-      // Usually it is the application/database column, so tuples with same such column values
-      // are grouped together.
-      column_node_t* temp = store[store_idx].columns;
-
-      // first node is for help/type info
-      if (!temp->next)
+      if (temp->query_alt->columns[i].type == LABEL_TYPE)
       {
-         temp->next = new_node;
-         store[store_idx].last_column = new_node;
+         /* Dealt with later */
+         continue;
+      }
+
+      /* Create metric name */
+      if (strlen(temp->query_alt->columns[i].name) > 0)
+      {
+         snprintf(metric_name, sizeof(metric_name), "pgexporter_%s_%s", temp->tag, temp->query_alt->columns[i].name);
       }
       else
       {
-         while (temp->next)
-         {
-            if (!strcmp(temp->next->tuple->data[0], current->data[0]))
-            {
-               break;
-            }
-            temp = temp->next;
-         }
+         snprintf(metric_name, sizeof(metric_name), "pgexporter_%s", temp->tag);
+      }
 
-         if (!temp->next)
+      /* Check if metric already exists in the bridge */
+      uintptr_t existing = pgexporter_art_search(bridge->metrics, metric_name);
+      if (existing != 0)
+      {
+         /* Metric already exists, use it */
+         metric = (struct prometheus_metric*)existing;
+      }
+      else
+      {
+         /* Create new metric */
+         metric = malloc(sizeof(struct prometheus_metric));
+         memset(metric, 0, sizeof(struct prometheus_metric));
+         
+         metric->name = strdup(metric_name);
+         metric->help = strdup(temp->query_alt->columns[i].description);
+         
+         /* Set metric type based on column type */
+         if (temp->query_alt->columns[i].type == GAUGE_TYPE)
          {
-            temp->next = new_node;
-            store[store_idx].last_column = new_node;
+            metric->type = strdup("gauge");
+         }
+         else if (temp->query_alt->columns[i].type == COUNTER_TYPE)
+         {
+            metric->type = strdup("counter");
          }
          else
          {
-            new_node->next = temp->next;
-            temp->next = new_node;
+            /* Default to gauge */
+            metric->type = strdup("gauge");
          }
+         
+         pgexporter_deque_create(false, &metric->definitions);
+         
+         /* Add to bridge */
+         pgexporter_art_insert(bridge->metrics, metric_name, (uintptr_t)metric, ValueRef);
       }
 
-   }
-   else
-   {
-      // Current can be null for SORT_NAME
-      // Default sort as SORT_NAME
-      store[store_idx].last_column->next = new_node;
-      store[store_idx].last_column = new_node;
+      /* Process all tuples */
+      struct tuple* tuple = temp->query->tuples;
+      while (tuple)
+      {
+         attrs = malloc(sizeof(struct prometheus_attributes));
+         memset(attrs, 0, sizeof(struct prometheus_attributes));
+         
+         pgexporter_deque_create(false, &attrs->attributes);
+         pgexporter_deque_create(false, &attrs->values);
+         
+         /* Add server attribute */
+         attr = malloc(sizeof(struct prometheus_attribute));
+         memset(attr, 0, sizeof(struct prometheus_attribute));
+         
+         attr->key = strdup("server");
+         attr->value = strdup(config->servers[tuple->server].name);
+         
+         pgexporter_deque_add(attrs->attributes, NULL, (uintptr_t)attr, ValueRef);
+         
+         /* Add label attributes */
+         for (int j = 0; j < temp->query_alt->n_columns; j++)
+         {
+            if (temp->query_alt->columns[j].type != LABEL_TYPE)
+            {
+               continue;
+            }
+            
+            attr = malloc(sizeof(struct prometheus_attribute));
+            memset(attr, 0, sizeof(struct prometheus_attribute));
+            
+            attr->key = strdup(temp->query_alt->columns[j].name);
+            
+            /* Use safe_prometheus_key for label values */
+            char* safe_key = safe_prometheus_key(pgexporter_get_column(j, tuple));
+            attr->value = strdup(safe_key);
+            safe_prometheus_key_free(safe_key);
+            
+            pgexporter_deque_add(attrs->attributes, NULL, (uintptr_t)attr, ValueRef);
+         }
+         
+         /* Add value */
+         val = malloc(sizeof(struct prometheus_value));
+         memset(val, 0, sizeof(struct prometheus_value));
+         
+         val->timestamp = time(NULL);
+         
+         /* Use get_value to convert the value appropriately */
+         char* value_str = get_value(temp->tag, 
+                                    temp->query_alt->columns[i].name, 
+                                    pgexporter_get_column(i, tuple));
+         val->value = strdup(value_str);
+         
+         pgexporter_deque_add(attrs->values, NULL, (uintptr_t)val, ValueRef);
+         
+         /* Add attributes to definitions */
+         pgexporter_deque_add(metric->definitions, NULL, (uintptr_t)attrs, ValueRef);
+         
+         tuple = tuple->next;
+      }
    }
 }
 
+
+
 static void
-handle_histogram(column_store_t* store, int* n_store, query_list_t* temp)
+handle_histogram(struct prometheus_bridge* bridge, query_list_t* temp)
 {
-   char* data = NULL;
-   char* safe_key = NULL;
-   struct configuration* config;
    int n_bounds = 0;
    int n_buckets = 0;
    char* bounds_arr[MAX_ARR_LENGTH] = {0};
    char* buckets_arr[MAX_ARR_LENGTH] = {0};
-   int idx = 0;
+   struct configuration* config;
+   struct prometheus_metric* bucket_metric = NULL;
+   struct prometheus_metric* sum_metric = NULL;
+   struct prometheus_metric* count_metric = NULL;
+   struct prometheus_attributes* attrs = NULL;
+   struct prometheus_attribute* attr = NULL;
+   struct prometheus_value* val = NULL;
+   char metric_name[256];
 
    config = (struct configuration*)shmem;
 
@@ -1679,398 +2047,297 @@ handle_histogram(column_store_t* store, int* n_store, query_list_t* temp)
                                  "_bucket"
                                  );
 
-   for (; idx < *n_store; idx++)
+   /* Create bucket metric */
+   snprintf(metric_name, sizeof(metric_name), "pgexporter_%s_bucket", temp->tag);
+   bucket_metric = malloc(sizeof(struct prometheus_metric));
+   memset(bucket_metric, 0, sizeof(struct prometheus_metric));
+   
+   bucket_metric->name = strdup(metric_name);
+   bucket_metric->help = strdup(temp->query_alt->columns[h_idx].description);
+   bucket_metric->type = strdup("histogram");
+   
+   pgexporter_deque_create(false, &bucket_metric->definitions);
+   
+   /* Create sum metric */
+   snprintf(metric_name, sizeof(metric_name), "pgexporter_%s_sum", temp->tag);
+   sum_metric = malloc(sizeof(struct prometheus_metric));
+   memset(sum_metric, 0, sizeof(struct prometheus_metric));
+   
+   sum_metric->name = strdup(metric_name);
+   sum_metric->help = strdup(temp->query_alt->columns[h_idx].description);
+   sum_metric->type = strdup("histogram");
+   
+   pgexporter_deque_create(false, &sum_metric->definitions);
+   
+   /* Create count metric */
+   snprintf(metric_name, sizeof(metric_name), "pgexporter_%s_count", temp->tag);
+   count_metric = malloc(sizeof(struct prometheus_metric));
+   memset(count_metric, 0, sizeof(struct prometheus_metric));
+   
+   count_metric->name = strdup(metric_name);
+   count_metric->help = strdup(temp->query_alt->columns[h_idx].description);
+   count_metric->type = strdup("histogram");
+   
+   pgexporter_deque_create(false, &count_metric->definitions);
+
+   struct tuple* current = temp->query->tuples;
+
+   while (current)
    {
-      if (store[idx].type == HISTOGRAM_TYPE &&
-          store[idx].sort_type == temp->sort_type &&
-          !strcmp(store[idx].tag, temp->tag) &&
-          !strcmp(store[idx].name, temp->query_alt->columns[h_idx].name))
-      {
-         break;
-      }
-   }
+      /* Parse bucket bounds and values */
+      char* bounds_str = pgexporter_get_column_by_name(names[2], temp->query, current);
+      parse_list(bounds_str, bounds_arr, &n_bounds);
 
-append:
-   if (idx < (*n_store))
-   {
-      struct tuple* current = temp->query->tuples;
+      char* buckets_str = pgexporter_get_column_by_name(names[3], temp->query, current);
+      parse_list(buckets_str, buckets_arr, &n_buckets);
 
-      while (current)
-      {
-         data = NULL;
-
-         /* bucket */
-         char* bounds_str = pgexporter_get_column_by_name(names[2], temp->query, current);
-         parse_list(bounds_str, bounds_arr, &n_bounds);
-
-         char* buckets_str = pgexporter_get_column_by_name(names[3], temp->query, current);
-         parse_list(buckets_str, buckets_arr, &n_buckets);
-
-         for (int i = 0; i < n_bounds; i++)
-         {
-            data = pgexporter_vappend(data, 8,
-                                      "pgexporter_",
-                                      temp->tag,
-                                      "_bucket{le=\"",
-                                      bounds_arr[i],
-                                      "\",",
-                                      "server=\"",
-                                      &config->servers[current->server].name[0],
-                                      "\""
-                                      );
-
-            for (int j = 0; j < h_idx; j++)
-            {
-               safe_key = safe_prometheus_key(pgexporter_get_column(j, current));
-               data = pgexporter_vappend(data, 5,
-                                         ",",
-                                         temp->query_alt->columns[j].name,
-                                         "=\"",
-                                         safe_key,
-                                         "\""
-                                         );
-               safe_prometheus_key_free(safe_key);
-            }
-
-            data = pgexporter_vappend(data, 3,
-                                      "} ",
-                                      buckets_arr[i],
-                                      "\n"
-                                      );
-         }
-
-         data = pgexporter_vappend(data, 6,
-                                   "pgexporter_",
-                                   temp->tag,
-                                   "_bucket{le=\"+Inf\",",
-                                   "server=\"",
-                                   &config->servers[current->server].name[0],
-                                   "\""
-                                   );
-
-         for (int j = 0; j < h_idx; j++)
-         {
-            safe_key = safe_prometheus_key(pgexporter_get_column(j, current));
-            data = pgexporter_vappend(data, 5,
-                                      ",",
-                                      temp->query_alt->columns[j].name,
-                                      "=\"",
-                                      safe_key,
-                                      "\""
-                                      );
-            safe_prometheus_key_free(safe_key);
-         }
-
-         data = pgexporter_vappend(data, 3,
-                                   "} ",
-                                   pgexporter_get_column_by_name(names[1], temp->query, current),
-                                   "\n"
-                                   );
-
-         /* sum */
-         data = pgexporter_vappend(data, 6,
-                                   "pgexporter_",
-                                   temp->tag,
-                                   "_sum",
-                                   "{server=\"",
-                                   &config->servers[current->server].name[0],
-                                   "\""
-                                   );
-
-         for (int j = 0; j < h_idx; j++)
-         {
-            safe_key = safe_prometheus_key(pgexporter_get_column(j, current));
-            data = pgexporter_vappend(data, 5,
-                                      ",",
-                                      temp->query_alt->columns[j].name,
-                                      "=\"",
-                                      safe_key,
-                                      "\""
-                                      );
-            safe_prometheus_key_free(safe_key);
-         }
-
-         data = pgexporter_vappend(data, 3,
-                                   "} ",
-                                   pgexporter_get_column_by_name(names[0], temp->query, current),
-                                   "\n"
-                                   );
-
-         /* count */
-         data = pgexporter_vappend(data, 6,
-                                   "pgexporter_",
-                                   temp->tag,
-                                   "_count",
-                                   "{server=\"",
-                                   &config->servers[current->server].name[0],
-                                   "\""
-                                   );
-
-         for (int j = 0; j < h_idx; j++)
-         {
-            safe_key = safe_prometheus_key(pgexporter_get_column(j, current));
-            data = pgexporter_vappend(data, 5,
-                                      ",",
-                                      temp->query_alt->columns[j].name,
-                                      "=\"",
-                                      safe_key,
-                                      "\""
-                                      );
-            safe_prometheus_key_free(safe_key);
-         }
-
-         data = pgexporter_vappend(data, 3,
-                                   "} ",
-                                   pgexporter_get_column_by_name(names[1], temp->query, current),
-                                   "\n"
-                                   );
-
-         add_column_to_store(store, idx, data, temp->sort_type, current);
-
-         current = current->next;
-      }
-
+      /* Process each bucket */
       for (int i = 0; i < n_bounds; i++)
       {
-         free(bounds_arr[i]);
+         attrs = malloc(sizeof(struct prometheus_attributes));
+         memset(attrs, 0, sizeof(struct prometheus_attributes));
+         
+         pgexporter_deque_create(false, &attrs->attributes);
+         pgexporter_deque_create(false, &attrs->values);
+         
+         /* Add le attribute */
+         attr = malloc(sizeof(struct prometheus_attribute));
+         memset(attr, 0, sizeof(struct prometheus_attribute));
+         
+         attr->key = strdup("le");
+         attr->value = strdup(bounds_arr[i]);
+         
+         pgexporter_deque_add(attrs->attributes, NULL, (uintptr_t)attr, ValueRef);
+         
+         /* Add server attribute */
+         attr = malloc(sizeof(struct prometheus_attribute));
+         memset(attr, 0, sizeof(struct prometheus_attribute));
+         
+         attr->key = strdup("server");
+         attr->value = strdup(config->servers[current->server].name);
+         
+         pgexporter_deque_add(attrs->attributes, NULL, (uintptr_t)attr, ValueRef);
+         
+         /* Add other attributes */
+         for (int j = 0; j < h_idx; j++)
+         {
+            attr = malloc(sizeof(struct prometheus_attribute));
+            memset(attr, 0, sizeof(struct prometheus_attribute));
+            
+            attr->key = strdup(temp->query_alt->columns[j].name);
+            attr->value = strdup(pgexporter_get_column(j, current));
+            
+            pgexporter_deque_add(attrs->attributes, NULL, (uintptr_t)attr, ValueRef);
+         }
+         
+         /* Add value */
+         val = malloc(sizeof(struct prometheus_value));
+         memset(val, 0, sizeof(struct prometheus_value));
+         
+         val->timestamp = time(NULL);
+         val->value = strdup(buckets_arr[i]);
+         
+         pgexporter_deque_add(attrs->values, NULL, (uintptr_t)val, ValueRef);
+         
+         /* Add to bucket metric */
+         pgexporter_deque_add(bucket_metric->definitions, NULL, (uintptr_t)attrs, ValueRef);
       }
 
-      for (int i = 0; i < n_buckets; i++)
+      /* Add +Inf bucket */
+      attrs = malloc(sizeof(struct prometheus_attributes));
+      memset(attrs, 0, sizeof(struct prometheus_attributes));
+      
+      pgexporter_deque_create(false, &attrs->attributes);
+      pgexporter_deque_create(false, &attrs->values);
+      
+      /* Add le attribute */
+      attr = malloc(sizeof(struct prometheus_attribute));
+      memset(attr, 0, sizeof(struct prometheus_attribute));
+      
+      attr->key = strdup("le");
+      attr->value = strdup("+Inf");
+      
+      pgexporter_deque_add(attrs->attributes, NULL, (uintptr_t)attr, ValueRef);
+      
+      /* Add server attribute */
+      attr = malloc(sizeof(struct prometheus_attribute));
+      memset(attr, 0, sizeof(struct prometheus_attribute));
+      
+      attr->key = strdup("server");
+      attr->value = strdup(config->servers[current->server].name);
+      
+      pgexporter_deque_add(attrs->attributes, NULL, (uintptr_t)attr, ValueRef);
+      
+      /* Add other attributes */
+      for (int j = 0; j < h_idx; j++)
       {
-         free(buckets_arr[i]);
+         attr = malloc(sizeof(struct prometheus_attribute));
+         memset(attr, 0, sizeof(struct prometheus_attribute));
+         
+         attr->key = strdup(temp->query_alt->columns[j].name);
+         attr->value = strdup(pgexporter_get_column(j, current));
+         
+         pgexporter_deque_add(attrs->attributes, NULL, (uintptr_t)attr, ValueRef);
       }
+      
+      /* Add value */
+      val = malloc(sizeof(struct prometheus_value));
+      memset(val, 0, sizeof(struct prometheus_value));
+      
+      val->timestamp = time(NULL);
+      val->value = strdup(pgexporter_get_column_by_name(names[1], temp->query, current));
+      
+      pgexporter_deque_add(attrs->values, NULL, (uintptr_t)val, ValueRef);
+      
+      /* Add to bucket metric */
+      pgexporter_deque_add(bucket_metric->definitions, NULL, (uintptr_t)attrs, ValueRef);
+
+      /* Add sum */
+      attrs = malloc(sizeof(struct prometheus_attributes));
+      memset(attrs, 0, sizeof(struct prometheus_attributes));
+      
+      pgexporter_deque_create(false, &attrs->attributes);
+      pgexporter_deque_create(false, &attrs->values);
+      
+      /* Add server attribute */
+      attr = malloc(sizeof(struct prometheus_attribute));
+      memset(attr, 0, sizeof(struct prometheus_attribute));
+      
+      attr->key = strdup("server");
+      attr->value = strdup(config->servers[current->server].name);
+      
+      pgexporter_deque_add(attrs->attributes, NULL, (uintptr_t)attr, ValueRef);
+      
+      /* Add other attributes */
+      for (int j = 0; j < h_idx; j++)
+      {
+         attr = malloc(sizeof(struct prometheus_attribute));
+         memset(attr, 0, sizeof(struct prometheus_attribute));
+         
+         attr->key = strdup(temp->query_alt->columns[j].name);
+         attr->value = strdup(pgexporter_get_column(j, current));
+         
+         pgexporter_deque_add(attrs->attributes, NULL, (uintptr_t)attr, ValueRef);
+      }
+      
+      /* Add value */
+      val = malloc(sizeof(struct prometheus_value));
+      memset(val, 0, sizeof(struct prometheus_value));
+      
+      val->timestamp = time(NULL);
+      val->value = strdup(pgexporter_get_column_by_name(names[0], temp->query, current));
+      
+      pgexporter_deque_add(attrs->values, NULL, (uintptr_t)val, ValueRef);
+      
+      /* Add to sum metric */
+      pgexporter_deque_add(sum_metric->definitions, NULL, (uintptr_t)attrs, ValueRef);
+
+      /* Add count */
+      attrs = malloc(sizeof(struct prometheus_attributes));
+      memset(attrs, 0, sizeof(struct prometheus_attributes));
+      
+      pgexporter_deque_create(false, &attrs->attributes);
+      pgexporter_deque_create(false, &attrs->values);
+      
+      /* Add server attribute */
+      attr = malloc(sizeof(struct prometheus_attribute));
+      memset(attr, 0, sizeof(struct prometheus_attribute));
+      
+      attr->key = strdup("server");
+      attr->value = strdup(config->servers[current->server].name);
+      
+      pgexporter_deque_add(attrs->attributes, NULL, (uintptr_t)attr, ValueRef);
+      
+      /* Add other attributes */
+      for (int j = 0; j < h_idx; j++)
+      {
+         attr = malloc(sizeof(struct prometheus_attribute));
+         memset(attr, 0, sizeof(struct prometheus_attribute));
+         
+         attr->key = strdup(temp->query_alt->columns[j].name);
+         attr->value = strdup(pgexporter_get_column(j, current));
+         
+         pgexporter_deque_add(attrs->attributes, NULL, (uintptr_t)attr, ValueRef);
+      }
+      
+      /* Add value */
+      val = malloc(sizeof(struct prometheus_value));
+      memset(val, 0, sizeof(struct prometheus_value));
+      
+      val->timestamp = time(NULL);
+      val->value = strdup(pgexporter_get_column_by_name(names[1], temp->query, current));
+      
+      pgexporter_deque_add(attrs->values, NULL, (uintptr_t)val, ValueRef);
+      
+      /* Add to count metric */
+      pgexporter_deque_add(count_metric->definitions, NULL, (uintptr_t)attrs, ValueRef);
+
+      current = current->next;
    }
-   else
+
+   /* Add metrics to bridge */
+   pgexporter_art_insert(bridge->metrics, bucket_metric->name, (uintptr_t)bucket_metric, ValueRef);
+   pgexporter_art_insert(bridge->metrics, sum_metric->name, (uintptr_t)sum_metric, ValueRef);
+   pgexporter_art_insert(bridge->metrics, count_metric->name, (uintptr_t)count_metric, ValueRef);
+
+   /* Clean up */
+   for (int i = 0; i < n_bounds; i++)
    {
+      free(bounds_arr[i]);
+   }
 
-      /* New Column */
-      if (!temp->query->tuples)
-      {
-         /* Skip */
-         return;
-      }
-
-      (*n_store)++;
-
-      store[idx].type = HISTOGRAM_TYPE;
-      store[idx].sort_type = temp->sort_type;
-      memcpy(store[idx].tag, temp->tag, MISC_LENGTH);
-      memcpy(store[idx].name, temp->query_alt->columns[h_idx].name, MISC_LENGTH);
-
-      data = NULL;
-      append_help_info(&data, store[idx].tag, "", temp->query_alt->columns[h_idx].description);
-      append_type_info(&data, store[idx].tag, "", temp->query_alt->columns[h_idx].type);
-
-      add_column_to_store(store, idx, data, SORT_NAME, NULL);
-
-      data = NULL;
-
-      // Inserted help and type info above, and then go to append label to insert the rest of the information as usual.
-      // (*n_store)++ ensures this time it fulfills the condition for the if-statement.
-      goto append;
+   for (int i = 0; i < n_buckets; i++)
+   {
+      free(buckets_arr[i]);
    }
 
    free(names[0]);
    free(names[1]);
    free(names[2]);
    free(names[3]);
-
 }
 
-static void
-handle_gauge_counter(column_store_t* store, int* n_store, query_list_t* temp)
+static int
+parse_list(char* list_str, char** strs, int* n_strs)
 {
+   int idx = 0;
    char* data = NULL;
-   char* safe_key = NULL;
-   struct configuration* config;
-   config = (struct configuration*)shmem;
+   char* p = NULL;
+   int len = strlen(list_str);
 
-   for (int i = 0; i < temp->query_alt->n_columns; i++)
+   /**
+    * If the `list_str` is `{c1,c2,c3,...,cn}`, and if the `strlen(list_str)`
+    * is `x`, then it takes `x + 1` bytes in memory including the null character.
+    *
+    * `data` will have `list_str` without the first and last bracket (so `data` will
+    * just be `c1,c2,c3,...,cn`) and thus `strlen(data)` will be `x - 2`, and
+    * so will take `x - 1` bytes in memory including the null character.
+    */
+   data = (char*) malloc((len - 1) * sizeof(char));
+   memset(data, 0, (len - 1) * sizeof(char));
+
+   /**
+    * If list_str is `{c1,c2,c3,...,cn}`, then and if `len(list_str)` is `len`
+    * then this starts from `c1`, and goes for `len - 2`, so till `cn`, so the
+    * `data` string becomes `c1,c2,c3,...,cn`
+    */
+   strncpy(data, list_str + 1, len - 2);
+
+   p = strtok(data, ",");
+   while (p)
    {
-      if (temp->query_alt->columns[i].type == LABEL_TYPE)
-      {
-         /* Dealt with later */
-         continue;
-      }
-
-      int idx = 0;
-      for (; idx < (*n_store); idx++)
-      {
-         if (!strcmp(store[idx].tag, temp->tag) &&
-             ((strlen(store[idx].name) == 0 && strlen(temp->query_alt->columns[i].name) == 0) ||
-              !strcmp(store[idx].name, temp->query_alt->columns[i].name)) &&
-             store[idx].type == temp->query_alt->columns[i].type
-             )
-         {
-            break;
-         }
-      }
-
-append:
-      if (!temp || !temp->query || !temp->query->tuples)
-      {
-         /* Skip */
-         continue;
-      }
-
-      if (idx < (*n_store))
-      {
-         /* Found Match */
-
-         struct tuple* tuple = temp->query->tuples;
-
-         while (tuple)
-         {
-            data = NULL;
-
-            data = pgexporter_vappend(data, 2,
-                                      "pgexporter_",
-                                      store[idx].tag
-                                      );
-
-            if (strlen(store[idx].name) > 0)
-            {
-               data = pgexporter_vappend(data, 2,
-                                         "_",
-                                         store[idx].name
-                                         );
-
-            }
-
-            data = pgexporter_vappend(data, 3,
-                                      "{server=\"",
-                                      config->servers[temp->query->tuples->server].name,
-                                      "\""
-                                      );
-
-            /* Labels */
-            for (int j = 0; j < temp->query_alt->n_columns; j++)
-            {
-               if (temp->query_alt->columns[j].type != LABEL_TYPE)
-               {
-                  continue;
-               }
-
-               safe_key = safe_prometheus_key(pgexporter_get_column(j, tuple));
-               data = pgexporter_vappend(data, 5,
-                                         ",",
-                                         temp->query_alt->columns[j].name,
-                                         "=\"",
-                                         safe_key,
-                                         "\""
-                                         );
-               safe_prometheus_key_free(safe_key);
-
-            }
-
-            data = pgexporter_vappend(data, 3,
-                                      "} ",
-                                      get_value(store[idx].tag, store[idx].name, pgexporter_get_column(i, tuple)),
-                                      "\n"
-                                      );
-
-            add_column_to_store(store, idx, data, temp->sort_type, tuple);
-
-            tuple = tuple->next;
-         }
-
-      }
-      else
-      {
-         /* New Column */
-         (*n_store)++;
-
-         memcpy(store[idx].name, temp->query_alt->columns[i].name, MISC_LENGTH);
-         store[idx].type = temp->query_alt->columns[i].type;
-         memcpy(store[idx].tag, temp->tag, MISC_LENGTH);
-
-         data = NULL;
-         append_help_info(&data, store[idx].tag, store[idx].name, temp->query_alt->columns[i].description);
-         append_type_info(&data, store[idx].tag, store[idx].name, temp->query_alt->columns[i].type);
-
-         add_column_to_store(store, idx, data, SORT_NAME, NULL);
-
-         data = NULL;
-
-         // Inserted help and type info above, and then go to append label to insert the rest of the information as usual.
-         // (*n_store)++ ensures this time it fulfills the condition for the if-statement.
-         goto append;
-      }
+      strs[idx] = NULL;
+      strs[idx] = pgexporter_append(strs[idx], p);
+      idx++;
+      p = strtok(NULL, ",");
    }
+
+   *n_strs = idx;
+   free(data);
+   return 0;
 }
 
-static void
-append_help_info(char** data, char* tag, char* name, char* description)
-{
-   *data = pgexporter_vappend(*data, 2,
-                              "#HELP pgexporter_",
-                              tag
-                              );
 
-   if (strlen(name) > 0)
-   {
-      *data = pgexporter_vappend(*data, 2,
-                                 "_",
-                                 name
-                                 );
-   }
-
-   *data = pgexporter_append(*data, " ");
-
-   if (description != NULL && strcmp("", description))
-   {
-      *data = pgexporter_append(*data, description);
-   }
-   else
-   {
-      *data = pgexporter_vappend(*data, 2,
-                                 "pgexporter_",
-                                 tag
-                                 );
-
-      if (strlen(name) > 0)
-      {
-         *data = pgexporter_vappend(*data, 2,
-                                    "_",
-                                    name
-                                    );
-      }
-   }
-
-   *data = pgexporter_append(*data, "\n");
-}
-
-static void
-append_type_info(char** data, char* tag, char* name, int typeId)
-{
-   *data = pgexporter_vappend(*data, 2,
-                              "#TYPE pgexporter_",
-                              tag
-                              );
-
-   if (strlen(name) > 0)
-   {
-      *data = pgexporter_vappend(*data, 2,
-                                 "_",
-                                 name
-                                 );
-   }
-
-   if (typeId == GAUGE_TYPE)
-   {
-      *data = pgexporter_append(*data, " gauge");
-   }
-   else if (typeId == COUNTER_TYPE)
-   {
-      *data = pgexporter_append(*data, " counter");
-   }
-   else if (typeId == HISTOGRAM_TYPE)
-   {
-      *data = pgexporter_append(*data, " histogram");
-   }
-
-   *data = pgexporter_append(*data, "\n");
-}
 
 static int
 send_chunk(int client_fd, char* data)
